@@ -10,30 +10,24 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-/** Data file, then manifest, then offset commit, then local delete. Never a different order (I1). */
+/** Data file, then manifest, then offset commit request, then local delete. Never a different order (I1). */
 @Component
 public class UploadWorker implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(UploadWorker.class);
     private static final Duration IDLE = Duration.ofSeconds(5);
     private static final Duration MAX_BACKOFF = Duration.ofMinutes(5);
-    private static final Duration COMMIT_TIMEOUT = Duration.ofSeconds(30);
 
     private final WorkDir workDir;
     private final S3Archive s3;
-    private final CommitQueue commitQueue;
+    private final BatchWriter batchWriter;
     private final BackupMetrics metrics;
     private final ObjectMapper json;
 
@@ -44,12 +38,12 @@ public class UploadWorker implements AutoCloseable {
     public UploadWorker(
             WorkDir workDir,
             S3Archive s3,
-            CommitQueue commitQueue,
+            BatchWriter batchWriter,
             BackupMetrics metrics,
             ObjectMapper json) {
         this.workDir = workDir;
         this.s3 = s3;
-        this.commitQueue = commitQueue;
+        this.batchWriter = batchWriter;
         this.metrics = metrics;
         this.json = json;
     }
@@ -99,20 +93,16 @@ public class UploadWorker implements AutoCloseable {
             throw e;
         }
 
-        commitQueue.submit(offsetsOf(manifest)).get(COMMIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+        // Fire-and-forget: if the commit fails, Kafka replays the records, so deleting is still safe.
+        if (!batchWriter.acknowledge(sealed)) {
+            log.info("{} was sealed before a restart; not committing, Kafka replays it", manifest.file());
+        }
 
         long bytes = Files.size(sealed.data());
         Files.delete(sealed.data());
         Files.delete(sealed.manifest());
         metrics.uploadSuccess(manifest.topic(), bytes, System.nanoTime() - start);
         log.info("Uploaded {} ({} records)", manifest.file(), manifest.records());
-    }
-
-    private static Map<TopicPartition, OffsetAndMetadata> offsetsOf(Manifest manifest) {
-        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
-        manifest.nextOffsets().forEach((partition, next) ->
-                offsets.put(new TopicPartition(manifest.topic(), partition), new OffsetAndMetadata(next)));
-        return offsets;
     }
 
     private static Duration nextBackoff(Duration current) {

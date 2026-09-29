@@ -28,7 +28,7 @@ Kafka ──poll(≤N rec / ≤B bytes)──▶ append to active.log (flush+fsy
                           sealed/<topic>_<window>.log  + .manifest.json
                                         │  Uploader
                                         ▼
-        S3 put data ─▶ S3 put manifest ─▶ commitSync(max offset+1) ─▶ delete local
+        S3 put data ─▶ S3 put manifest ─▶ ack batches (Spring commits) ─▶ delete local
 ```
 
 No compression. No `.done` marker. No separate HEAD verify: the S3 `PutObject` is sent with a SHA-256 checksum, and S3 rejects the upload if it does not match.
@@ -66,10 +66,10 @@ Raw message value, one message per line, in offset order. Nothing else is writte
 
 | Component | Job | Thread |
 |---|---|---|
-| `ConsumerLoop` | poll, hand batch to writer; no auto-commit; pause if disk is full | 1 dedicated |
-| `BatchWriter` | append batch to active file under lock, flush+fsync, record offsets in memory | same thread |
+| `TopicConsumers` | one Spring Kafka listener container per topic, `AckMode.MANUAL`; pause all if disk is full or a gap is seen | 1 per topic |
+| `BatchWriter` | append batch to active file under lock, flush+fsync, record offsets and the latest ack per partition in memory | listener threads |
 | `FileRotator` | on tick: lock → close active → rename to `sealed/` → write manifest → open fresh active → unlock | scheduler |
-| `Uploader` | upload data, then manifest, then commit, then delete | 1 worker |
+| `Uploader` | upload data, then manifest, then ack the file's batches, then delete | 1 worker |
 | `RecoveryService` | on startup, before consuming | main |
 
 ### Locking (I3)
@@ -87,16 +87,17 @@ work-dir/
 A file still in `sealed/` = not yet fully uploaded and committed.
 
 ### Offset commit (I1)
-Consumer keeps polling while commits lag until the upload finishes. After data + manifest are in S3: `commitSync` the max offset + 1 per partition, then delete the local pair. Kafka retention must be ≥ 24h. Use a single instance with a static `group.instance.id`.
+Consumer keeps polling while commits lag until the upload finishes. After data + manifest are in S3 the uploader calls `acknowledge()` on the latest batch of every partition in the file, oldest first; Spring queues those acks and commits them (async, failures counted in `kb_commit_failure_total`) on the consumer thread. The local pair is then deleted without waiting: a failed commit only causes a replay. One container per topic, because an ack commits every partition in its batch and files are per topic. Kafka retention must be ≥ 24h. Use a single instance with a static `group.instance.id`; each container suffixes it with `-<topic>`.
 
 ### Failure handling
 | Failure | Behavior |
 |---|---|
 | S3 upload fails | retry with backoff, forever; file stays in `sealed/`; no commit; consumer keeps writing to the new active file |
 | Crash with data only in `active/` | `active/` is discarded on restart; consumer resumes from last commit and replays (nothing lost) |
-| Crash with files in `sealed/` | Recovery re-uploads them (idempotent keys), commits, deletes, then starts the consumer |
-| Disk > 80 % | `pause()` consumer; resume < 70 % |
+| Crash with files in `sealed/` | Uploader re-uploads them (idempotent keys) and deletes them without committing (their acks were in memory); Kafka replays those records into new files: duplicates, no loss |
+| Disk > 80 % | `pause()` all containers (checked every second); resume < 70 % |
 | Offset gap in a batch (`next != prev+1`) | pause, alert, no commit (disable for compacted topics) |
+| Batch cannot be written to disk | container stops (`CommonContainerStoppingErrorHandler`); the batch is never skipped or committed |
 
 ## 4. Metrics (Micrometer → Prometheus, tag `topic`)
 
@@ -113,7 +114,7 @@ Package root `com.example.kafkabackup`.
 
 **P1 Config & keys**: `BackupProperties`, `WindowCalculator`, `S3KeyBuilder`, `Manifest` model. Accept: unit tests: 00:00 D → D-1 hour 23; 01:00 → D hour 00; correct `ingestion/` and `logs/` keys.
 
-**P2 Consume + write**: `ConsumerLoop`, `BatchWriter` (append, fsync, offsets in memory, gap check). Accept: Testcontainers Kafka, produce 10 000 → active file has 10 000 lines; no commit.
+**P2 Consume + write**: `TopicConsumers`, `BatchWriter` (append, fsync, offsets in memory, gap check). Accept: Testcontainers Kafka, produce 10 000 → active file has 10 000 lines; no commit.
 
 **P3 Rotate + lock**: `FileRotator`, lock, manifest writer. Accept: concurrent test with producer running during 50 rotations: total lines across sealed + active == produced; manifest offsets match file lines.
 

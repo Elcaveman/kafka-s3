@@ -18,7 +18,9 @@ public class RecoveryService {
 
     /**
      * Active files were never sealed and their offsets were never committed, so Kafka still has
-     * the records: drop them and let the consumer replay. Sealed files are left for the uploader.
+     * the records: drop them and let the consumer replay. Sealed files are left for the uploader, which
+     * uploads them without committing (their acks died with the old process), so Kafka replays those
+     * records too: duplicates in S3, never a loss.
      */
     public void run() {
         workDir.discardActiveFiles();

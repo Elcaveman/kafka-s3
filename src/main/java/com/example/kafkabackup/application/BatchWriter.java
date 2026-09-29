@@ -15,15 +15,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 /**
@@ -38,6 +42,9 @@ public class BatchWriter {
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<String, ActiveFile> active = new HashMap<>();
     private final Map<TopicPartition, Long> lastOffset = new HashMap<>();
+    private final Map<String, Map<Integer, Acknowledgment>> latestAcks = new HashMap<>();
+    /** Read by the uploader without the lock. */
+    private final Map<Path, List<Acknowledgment>> sealedAcks = new ConcurrentHashMap<>();
 
     private final WorkDir workDir;
     private final S3Keys s3Keys;
@@ -60,21 +67,25 @@ public class BatchWriter {
         this.json = json;
     }
 
-    public void append(ConsumerRecords<String, byte[]> records) {
+    /** Called on a listener container thread; each container consumes one topic. */
+    public void append(List<ConsumerRecord<String, byte[]>> records, Acknowledgment ack) {
         if (records.isEmpty()) {
             return;
         }
+        String topic = records.get(0).topic();
+        if (records.stream().anyMatch(r -> !r.topic().equals(topic))) {
+            throw new IllegalStateException("A batch must hold a single topic: its ack commits all of it");
+        }
         lock.lock();
         try {
+            ActiveFile file = activeFor(topic);
             for (ConsumerRecord<String, byte[]> record : records) {
                 checkGap(record);
-                activeFor(record.topic()).append(record.value(), record.partition(), record.offset());
+                file.append(record.value(), record.partition(), record.offset());
             }
-            for (ActiveFile file : active.values()) {
-                file.fsync();
-            }
-            records.partitions().forEach(tp ->
-                    metrics.recordsConsumed(tp.topic(), records.records(tp).size()));
+            file.fsync();
+            rememberAck(topic, records, ack);
+            metrics.recordsConsumed(topic, records.size());
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         } finally {
@@ -87,6 +98,7 @@ public class BatchWriter {
         lock.lock();
         try {
             ActiveFile file = active.remove(topic);
+            Map<Integer, Acknowledgment> acks = latestAcks.remove(topic);
             if (file == null || file.records() == 0) {
                 closeAndDropEmpty(file);
                 return Optional.empty();
@@ -103,6 +115,8 @@ public class BatchWriter {
 
             Path data = workDir.sealedData(topic, window.id(), uid);
             Files.move(file.path(), data, StandardCopyOption.ATOMIC_MOVE);
+            // Registered before the manifest exists, since the manifest is what the uploader looks for.
+            sealedAcks.put(data, List.copyOf(new LinkedHashSet<>(acks.values())));
 
             Path manifestPath = workDir.sealedManifest(topic, window.id(), uid);
             json.writeValue(manifestPath.toFile(), manifest);
@@ -116,8 +130,34 @@ public class BatchWriter {
         }
     }
 
+    /**
+     * Asks Kafka to commit a sealed file's offsets. Returns false for a file sealed before a restart:
+     * its acks are gone, and Kafka replays whatever was not committed.
+     */
+    public boolean acknowledge(SealedFile sealed) {
+        List<Acknowledgment> acks = sealedAcks.remove(sealed.data());
+        if (acks == null) {
+            return false;
+        }
+        acks.forEach(Acknowledgment::acknowledge);
+        return true;
+    }
+
     public boolean gapDetected() {
         return gapDetected;
+    }
+
+    /**
+     * An ack commits only the partitions present in its own batch, so a file needs the latest ack of
+     * every partition it holds. Re-inserting keeps the map in arrival order, so acks are replayed
+     * oldest first and a commit never moves backwards. Only these batches stay in memory.
+     */
+    private void rememberAck(String topic, List<ConsumerRecord<String, byte[]>> records, Acknowledgment ack) {
+        Map<Integer, Acknowledgment> acks = latestAcks.computeIfAbsent(topic, t -> new LinkedHashMap<>());
+        records.stream().map(ConsumerRecord::partition).distinct().forEach(partition -> {
+            acks.remove(partition);
+            acks.put(partition, ack);
+        });
     }
 
     private ActiveFile activeFor(String topic) throws IOException {

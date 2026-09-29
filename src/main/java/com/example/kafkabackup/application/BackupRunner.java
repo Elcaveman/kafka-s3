@@ -8,19 +8,19 @@ import org.springframework.stereotype.Component;
 public class BackupRunner implements ApplicationRunner {
 
     private final RecoveryService recovery;
-    private final ConsumerLoop consumerLoop;
+    private final TopicConsumers consumers;
     private final UploadWorker uploadWorker;
 
-    public BackupRunner(RecoveryService recovery, ConsumerLoop consumerLoop, UploadWorker uploadWorker) {
+    public BackupRunner(RecoveryService recovery, TopicConsumers consumers, UploadWorker uploadWorker) {
         this.recovery = recovery;
-        this.consumerLoop = consumerLoop;
+        this.consumers = consumers;
         this.uploadWorker = uploadWorker;
     }
 
     @Override
     public void run(ApplicationArguments args) {
         recovery.run();
-        consumerLoop.start();
+        consumers.start();
         uploadWorker.start();
     }
 }
