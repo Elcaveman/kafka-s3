@@ -54,6 +54,7 @@ public class TopicConsumers implements AutoCloseable {
         for (String topic : properties.topics()) {
             KafkaMessageListenerContainer<String, byte[]> container =
                     new KafkaMessageListenerContainer<>(consumerFactory, containerProperties(topic));
+            container.setBeanName("consumer-" + topic);
             // A batch that cannot be written to disk must not be skipped and committed: stop instead.
             container.setCommonErrorHandler(new CommonContainerStoppingErrorHandler());
             container.start();

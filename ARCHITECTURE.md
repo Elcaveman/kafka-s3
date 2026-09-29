@@ -87,7 +87,7 @@ work-dir/
 A file still in `sealed/` = not yet fully uploaded and committed.
 
 ### Offset commit (I1)
-Consumer keeps polling while commits lag until the upload finishes. After data + manifest are in S3 the uploader calls `acknowledge()` on the latest batch of every partition in the file, oldest first; Spring queues those acks and commits them (async, failures counted in `kb_commit_failure_total`) on the consumer thread. The local pair is then deleted without waiting: a failed commit only causes a replay. One container per topic, because an ack commits every partition in its batch and files are per topic. Kafka retention must be ≥ 24h. Use a single instance with a static `group.instance.id`; each container suffixes it with `-<topic>`.
+Consumer keeps polling while commits lag until the upload finishes. After data + manifest are in S3 the uploader calls `acknowledge()` on the latest batch of every partition in the file, oldest first; A file's acks wait until every older file of its topic is uploaded too (files sealed in the same hour can be uploaded out of order), so a commit never passes records that are not in S3 and never moves backwards. Spring queues those acks and commits them (async, failures counted in `kb_commit_failure_total`) on the consumer thread. The local pair is then deleted without waiting: a failed commit only causes a replay. One container per topic, because an ack commits every partition in its batch and files are per topic. Kafka retention must be ≥ 24h. Use a single instance with a static `group.instance.id`; each container suffixes it with `-<topic>`.
 
 ### Failure handling
 | Failure | Behavior |

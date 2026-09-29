@@ -14,6 +14,8 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -21,7 +23,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
@@ -43,8 +44,8 @@ public class BatchWriter {
     private final Map<String, ActiveFile> active = new HashMap<>();
     private final Map<TopicPartition, Long> lastOffset = new HashMap<>();
     private final Map<String, Map<Integer, Acknowledgment>> latestAcks = new HashMap<>();
-    /** Read by the uploader without the lock. */
-    private final Map<Path, List<Acknowledgment>> sealedAcks = new ConcurrentHashMap<>();
+    /** Per topic, in seal order. Guarded by its own monitor: the uploader never takes {@code lock}. */
+    private final Map<String, Deque<PendingCommit>> pendingCommits = new HashMap<>();
 
     private final WorkDir workDir;
     private final S3Keys s3Keys;
@@ -116,7 +117,10 @@ public class BatchWriter {
             Path data = workDir.sealedData(topic, window.id(), uid);
             Files.move(file.path(), data, StandardCopyOption.ATOMIC_MOVE);
             // Registered before the manifest exists, since the manifest is what the uploader looks for.
-            sealedAcks.put(data, List.copyOf(new LinkedHashSet<>(acks.values())));
+            synchronized (pendingCommits) {
+                pendingCommits.computeIfAbsent(topic, t -> new ArrayDeque<>())
+                        .add(new PendingCommit(data, List.copyOf(new LinkedHashSet<>(acks.values()))));
+            }
 
             Path manifestPath = workDir.sealedManifest(topic, window.id(), uid);
             json.writeValue(manifestPath.toFile(), manifest);
@@ -131,16 +135,28 @@ public class BatchWriter {
     }
 
     /**
-     * Asks Kafka to commit a sealed file's offsets. Returns false for a file sealed before a restart:
-     * its acks are gone, and Kafka replays whatever was not committed.
+     * Marks a sealed file as uploaded and asks Kafka to commit every file of its topic that is now
+     * uploaded along with all older ones. A newer file uploaded first waits: committing it would also
+     * commit past the older file's records, which are not in S3 yet.
+     *
+     * <p>Returns false for a file sealed before a restart: its acks are gone, and Kafka replays
+     * whatever was not committed.
      */
     public boolean acknowledge(SealedFile sealed) {
-        List<Acknowledgment> acks = sealedAcks.remove(sealed.data());
-        if (acks == null) {
+        synchronized (pendingCommits) {
+            for (Deque<PendingCommit> queue : pendingCommits.values()) {
+                for (PendingCommit pending : queue) {
+                    if (pending.data.equals(sealed.data())) {
+                        pending.uploaded = true;
+                        while (!queue.isEmpty() && queue.peek().uploaded) {
+                            queue.poll().acks.forEach(Acknowledgment::acknowledge);
+                        }
+                        return true;
+                    }
+                }
+            }
             return false;
         }
-        acks.forEach(Acknowledgment::acknowledge);
-        return true;
     }
 
     public boolean gapDetected() {
@@ -158,6 +174,17 @@ public class BatchWriter {
             acks.remove(partition);
             acks.put(partition, ack);
         });
+    }
+
+    private static final class PendingCommit {
+        private final Path data;
+        private final List<Acknowledgment> acks;
+        private boolean uploaded;
+
+        private PendingCommit(Path data, List<Acknowledgment> acks) {
+            this.data = data;
+            this.acks = acks;
+        }
     }
 
     private ActiveFile activeFor(String topic) throws IOException {
