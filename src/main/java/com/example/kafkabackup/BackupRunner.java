@@ -1,5 +1,7 @@
 package com.example.kafkabackup;
 
+import com.example.kafkabackup.ingest.ConsumerLoop;
+import com.example.kafkabackup.shared.WorkDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;

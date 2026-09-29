@@ -23,6 +23,10 @@ spring:
       value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
       properties:
         group.instance.id: ${HOSTNAME:local}
+  task:
+    scheduling:
+      pool:
+        size: 2 # one thread for the hourly rotation, one for the uploader
 
 backup:
   topics: [orders, payments]

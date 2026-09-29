@@ -69,8 +69,19 @@ Raw message value, one message per line, in offset order. Nothing else is writte
 | `ConsumerLoop` | poll, hand batch to writer; no auto-commit; pause if disk is full | 1 dedicated |
 | `BatchWriter` | append batch to active file under lock, flush+fsync, record offsets in memory | same thread |
 | `FileRotator` | on tick: lock → close active → rename to `sealed/` → write manifest → open fresh active → unlock | scheduler |
-| `Uploader` | upload data, then manifest, then commit, then delete | 1 worker |
-| `RecoveryService` | on startup, before consuming | main |
+| `UploadWorker` | upload data, then manifest, then commit, then delete | scheduler, every 5 s |
+| `BackupRunner` | on startup: discard `active/`, then start the consumer | main |
+
+### Modules
+```
+com.example.kafkabackup
+  shared/     BackupProperties, BackupConfig, BackupMetrics, WorkDir, SealedFile, S3Archive
+  ingest/     ConsumerLoop, BatchWriter, ActiveFile, FileRotator, BackupWindow
+  datafile/   DataFileUploader  - data key layout + .log upload
+  manifest/   Manifest, ManifestStore (local JSON), ManifestUploader - manifest key + upload
+  upload/     UploadWorker      - orders the two uploads, the commit and the delete
+```
+`S3Archive` is the only class that touches the S3 SDK. Dependencies point `upload → ingest/manifest/datafile → shared`; nothing points back.
 
 ### Locking (I3)
 One `ReentrantLock` guards the active file handle.
@@ -92,7 +103,7 @@ Consumer keeps polling while commits lag until the upload finishes. After data +
 ### Failure handling
 | Failure | Behavior |
 |---|---|
-| S3 upload fails | retry with backoff, forever; file stays in `sealed/`; no commit; consumer keeps writing to the new active file |
+| S3 upload fails | retried on the next 5 s tick, forever; file stays in `sealed/`; no commit; consumer keeps writing to the new active file |
 | Crash with data only in `active/` | `active/` is discarded on restart; consumer resumes from last commit and replays (nothing lost) |
 | Crash with files in `sealed/` | Recovery re-uploads them (idempotent keys), commits, deletes, then starts the consumer |
 | Disk > 80 % | `pause()` consumer; resume < 70 % |
@@ -117,9 +128,9 @@ Package root `com.example.kafkabackup`.
 
 **P3 Rotate + lock**: `FileRotator`, lock, manifest writer. Accept: concurrent test with producer running during 50 rotations: total lines across sealed + active == produced; manifest offsets match file lines.
 
-**P4 Upload + commit**: `Uploader` (data → manifest → commit → delete, backoff). Accept: LocalStack test: both objects at expected keys, committed offset == max+1; injected S3 failure → no commit, then success.
+**P4 Upload + commit**: `UploadWorker` (data → manifest → commit → delete, retried on the next tick). Accept: LocalStack test: both objects at expected keys, committed offset == max+1; injected S3 failure → no commit, then success.
 
-**P5 Recovery + metrics + E2E**: `RecoveryService`, metrics, Dockerfile. Accept: kill -9 mid-batch, post-seal and post-upload-pre-commit → every produced offset present in S3 manifests at least once.
+**P5 Recovery + metrics + E2E**: startup recovery in `BackupRunner`, metrics, Dockerfile. Accept: kill -9 mid-batch, post-seal and post-upload-pre-commit → every produced offset present in S3 manifests at least once.
 
 ## 6. Config
 
