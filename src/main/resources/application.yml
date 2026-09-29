@@ -1,0 +1,53 @@
+spring:
+  application:
+    name: kafka-s3-backup
+  config:
+    import: vault://
+  cloud:
+    vault:
+      uri: ${VAULT_URI:http://localhost:8200}
+      authentication: APPROLE
+      app-role:
+        role-id: ${VAULT_ROLE_ID}
+        secret-id: ${VAULT_SECRET_ID}
+      kv:
+        enabled: true
+        backend: secret
+        default-context: application
+  kafka:
+    consumer:
+      group-id: kafka-s3-backup
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+      properties:
+        group.instance.id: ${HOSTNAME:local}
+
+backup:
+  topics: [orders, payments]
+  zone: UTC
+  rotate-cron: "5 0 * * * *"
+  work-dir: /data/kafka-backup
+  application-name: kafka-s3-backup
+  gap-check: true
+  batch:
+    max-records: 500
+    max-bytes: 4MB
+    poll-timeout: 1s
+  disk:
+    pause-above: 0.80
+    resume-below: 0.70
+  s3:
+    bucket: my-backup
+    region: eu-west-3
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
